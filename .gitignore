@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.superpowers/
+.pytest_cache/
+build/
+dist/
+packet_debug.txt
+calibration.json
