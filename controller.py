@@ -2,10 +2,8 @@ import ctypes
 import threading
 import time
 
-SHIFT_UP_BTN   = 0x2000   # B button (swap with SHIFT_DOWN_BTN if inverted)
-SHIFT_DOWN_BTN = 0x4000   # X button
-_POLL_S        = 0.016     # ~60 Hz
-_RETRY_S       = 1.0       # seconds between reconnect attempts
+_POLL_S  = 0.016    # ~60 Hz
+_RETRY_S = 1.0      # seconds between reconnect attempts
 
 
 class XINPUT_GAMEPAD(ctypes.Structure):
@@ -31,10 +29,11 @@ class ControllerState:
     """Shared container written by the XInput thread, read by the GUI thread."""
 
     def __init__(self):
-        self.lt_pct: int = 0          # left trigger (brake) 0-100
-        self.rt_pct: int = 0          # right trigger (throttle) 0-100
-        self.shift_up: bool = False
+        self.lt_pct:    int  = 0
+        self.rt_pct:    int  = 0
+        self.shift_up:  bool = False
         self.shift_down: bool = False
+        self.clutch:    bool = False
         self.connected: bool = False
 
 
@@ -43,7 +42,13 @@ def _trigger_pct(raw: int) -> int:
     return round(raw / 255 * 100)
 
 
-def start_controller_listener(state: ControllerState, controller_index: int = 0) -> None:
+def start_controller_listener(
+    state: ControllerState,
+    shift_up_button: int,
+    shift_down_button: int,
+    clutch_button: int,
+    controller_index: int = 0,
+) -> None:
     """Start XInput polling in a daemon thread. Non-fatal if XInput is unavailable."""
     try:
         xinput = ctypes.windll.xinput1_4
@@ -59,8 +64,9 @@ def start_controller_listener(state: ControllerState, controller_index: int = 0)
                 gp = xi_state.Gamepad
                 state.lt_pct     = _trigger_pct(gp.bLeftTrigger)
                 state.rt_pct     = _trigger_pct(gp.bRightTrigger)
-                state.shift_up   = bool(gp.wButtons & SHIFT_UP_BTN)
-                state.shift_down = bool(gp.wButtons & SHIFT_DOWN_BTN)
+                state.shift_up   = bool(gp.wButtons & shift_up_button)
+                state.shift_down = bool(gp.wButtons & shift_down_button)
+                state.clutch     = bool(gp.wButtons & clutch_button) if clutch_button else False
                 state.connected  = True
                 time.sleep(_POLL_S)
             else:
