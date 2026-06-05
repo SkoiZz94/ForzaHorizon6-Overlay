@@ -9,7 +9,6 @@ from telemetry import TelemetryState, start_udp_listener, lights_state, COLOR_UN
 from telemetry import NUM_LIGHTS, SHIFT_RATIO
 from controller import ControllerState, start_controller_listener
 
-UDP_PORT     = 20777
 TOP_MARGIN   = 10      # px from top of screen
 UPDATE_MS    = 50      # repaint interval (20 fps)
 
@@ -141,22 +140,31 @@ class TopBarOverlay(QWidget):
         # Gear box
         gear_y = top_y + SHIFT_H + 2
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#0f172a"))
-        painter.drawRoundedRect(col_x, gear_y, CENTER_W, GEAR_H, 3, 3)
 
-        if not self._tel.connected:
-            gear_label = "–"
-        elif self._tel.gear in (0, 11):
-            gear_label = "R"
-        elif self._tel.is_electric:
-            gear_label = "D"
+        if self._ctrl.clutch:
+            painter.setBrush(self._shift_color(1.0))
+            painter.drawRoundedRect(col_x, gear_y, CENTER_W, GEAR_H, 3, 3)
+            painter.setPen(QColor("#1a1200"))
+            painter.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
+            painter.drawText(QRect(col_x, gear_y, CENTER_W, GEAR_H),
+                             Qt.AlignmentFlag.AlignCenter, "C")
         else:
-            gear_label = str(self._tel.gear)
+            painter.setBrush(QColor("#0f172a"))
+            painter.drawRoundedRect(col_x, gear_y, CENTER_W, GEAR_H, 3, 3)
 
-        painter.setPen(QColor("#e2e8f0"))
-        painter.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
-        painter.drawText(QRect(col_x, gear_y, CENTER_W, GEAR_H),
-                         Qt.AlignmentFlag.AlignCenter, gear_label)
+            if not self._tel.connected:
+                gear_label = "–"
+            elif self._tel.display_gear == 0:
+                gear_label = "R"
+            elif self._tel.is_electric:
+                gear_label = "D"
+            else:
+                gear_label = str(self._tel.display_gear)
+
+            painter.setPen(QColor("#e2e8f0"))
+            painter.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
+            painter.drawText(QRect(col_x, gear_y, CENTER_W, GEAR_H),
+                             Qt.AlignmentFlag.AlignCenter, gear_label)
 
         # Shift DOWN button
         dn_y   = gear_y + GEAR_H + 2
@@ -254,22 +262,40 @@ def _tray_icon() -> QIcon:
 
 
 def main():
+    import argparse
+    from config import load_config, CONFIG_PATH
+    from setup_wizard import SetupWizard
+
+    parser = argparse.ArgumentParser(description='FH6 rev light overlay')
+    parser.add_argument('--port', type=int, default=None,
+                        help='UDP port override (default: from config.ini)')
+    args = parser.parse_args()
+
+    # QApplication must exist before the wizard (both are PyQt6 windows)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    if not CONFIG_PATH.exists():
+        wizard = SetupWizard(CONFIG_PATH)
+        wizard.exec()
+
+    config = load_config(CONFIG_PATH)
+    port   = args.port if args.port is not None else config.udp_port
+
     tel  = TelemetryState()
     ctrl = ControllerState()
 
     try:
-        start_udp_listener(tel, UDP_PORT)
+        start_udp_listener(tel, port)
     except OSError as e:
-        print(f"Error: could not bind to port {UDP_PORT}.")
+        print(f"Error: could not bind to port {port}.")
         print(f"Make sure no other instance of the overlay is already running.")
         print(f"Details: {e}")
         sys.exit(1)
 
-    start_controller_listener(ctrl)
-
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # keep alive when overlay is the only window
-    signal.signal(signal.SIGINT, signal.SIG_DFL)  # Ctrl+C exits cleanly without traceback
+    start_controller_listener(ctrl, config.shift_up_button,
+                              config.shift_down_button, config.clutch_button)
 
     tray = QSystemTrayIcon(_tray_icon(), parent=app)
     tray.setToolTip("FH6 Overlay")
@@ -280,7 +306,6 @@ def main():
 
     overlay = TopBarOverlay(tel, ctrl)
 
-    # Quit shortcuts for when running from terminal
     for seq in ("Escape", "Ctrl+Q"):
         QShortcut(QKeySequence(seq), overlay, activated=app.quit)
 

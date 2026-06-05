@@ -14,6 +14,7 @@ _PEAK_ACTIVATE_FRAC = 0.65   # only calibrate once peak > this fraction of repor
 _STABILITY_SECS     = 0.25   # RPM must be stable for this many seconds (plateau fallback)
 _STABILITY_TOL      = 0.02   # "stable" = within 2% of peak
 _MAX_HEADROOM       = 1.03   # effective_max = observed_peak × this (small buffer above peak)
+_DEFAULT_MAX_FRAC   = 0.90   # fallback when uncalibrated: assume redline = 90% of reported max
 
 COLOR_GREEN  = "#22c55e"
 COLOR_YELLOW = "#eab308"
@@ -86,6 +87,7 @@ class TelemetryState:
         self.is_electric: bool = False      # True when idle_rpm < 100 (no idle = electric)
         self.packet_has_gear: bool = False  # True when packet was long enough for gear byte
         self.gear: int = 0
+        self.display_gear: int = 0   # like gear but skips transient gear=11 bursts
         self._last_packet_time: float = 0.0
         self._peak_rpm: float = 0.0
         self._peak_stable_since: float = 0.0
@@ -114,7 +116,8 @@ class TelemetryState:
             self._last_idle_rpm = idle_rpm
             self._peak_rpm = 0.0
             self._peak_stable_since = now
-            self.gear = 0   # reset so first gear reading doesn't trigger false upshift
+            self.gear = 0          # reset so first gear reading doesn't trigger false upshift
+            self.display_gear = 0
             self._effective_max = (
                 0.0 if self.is_electric
                 else self._cal_db.get(_cal_key(max_rpm, idle_rpm), 0.0)
@@ -123,16 +126,20 @@ class TelemetryState:
         # Detect upshift before updating gear (self.gear is still the previous value)
         upshift = gear > self.gear and self.gear > 0
         self.gear = gear
+        if gear != 11:
+            self.display_gear = gear
 
         if self.is_electric:
             self.ratio = 0.0
         else:
             key = _cal_key(max_rpm, idle_rpm)
 
-            # Track the highest RPM seen
+            # Track the highest RPM seen; only reset the stability timer on a
+            # significant new peak so limiter bouncing doesn't starve the fallback.
             if current_rpm > self._peak_rpm:
+                if current_rpm > self._peak_rpm * (1.0 + _STABILITY_TOL):
+                    self._peak_stable_since = now
                 self._peak_rpm = current_rpm
-                self._peak_stable_since = now
 
             if self._peak_rpm > max_rpm * _PEAK_ACTIVATE_FRAC:
                 # Primary: calibrate on every upshift — RPM just before the shift IS the
@@ -147,7 +154,7 @@ class TelemetryState:
                         and current_rpm >= self._peak_rpm * (1.0 - _STABILITY_TOL)):
                     self._try_save_calibration(key, self._peak_rpm * _MAX_HEADROOM)
 
-            effective_max = self._effective_max or max_rpm
+            effective_max = self._effective_max or (max_rpm * _DEFAULT_MAX_FRAC)
             self.ratio = compute_ratio(current_rpm, idle_rpm, effective_max)
 
         self.connected = True
