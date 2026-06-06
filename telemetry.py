@@ -169,6 +169,14 @@ class TelemetryState:
             self._last_max_rpm = -1.0   # force calibration re-lookup on reconnect
             self._last_idle_rpm = -1.0
 
+    def reset_calibration(self) -> None:
+        """Clear all calibration data from memory and delete the on-disk file."""
+        self._cal_db.clear()
+        self._effective_max = 0.0
+        self._peak_rpm = 0.0
+        self._peak_stable_since = 0.0
+        _CAL_FILE.unlink(missing_ok=True)
+
 
 def start_udp_listener(state: TelemetryState, port: int) -> None:
     """Bind a UDP socket and start a daemon thread that populates `state`.
