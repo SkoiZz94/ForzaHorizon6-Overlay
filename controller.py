@@ -29,12 +29,13 @@ class ControllerState:
     """Shared container written by the XInput thread, read by the GUI thread."""
 
     def __init__(self):
-        self.lt_pct:    int  = 0
-        self.rt_pct:    int  = 0
-        self.shift_up:  bool = False
+        self.lt_pct:     int  = 0
+        self.rt_pct:     int  = 0
+        self.shift_up:   bool = False
         self.shift_down: bool = False
-        self.clutch:    bool = False
-        self.connected: bool = False
+        self.clutch:     bool = False
+        self.connected:  bool = False
+        self.toggle_hide: bool = False  # True for exactly one tick on hide rising edge
 
 
 def _trigger_pct(raw: int) -> int:
@@ -47,6 +48,7 @@ def start_controller_listener(
     shift_up_button: int,
     shift_down_button: int,
     clutch_button: int,
+    hide_button: int = 0,
     controller_index: int = 0,
 ) -> None:
     """Start XInput polling in a daemon thread. Non-fatal if XInput is unavailable."""
@@ -58,19 +60,28 @@ def start_controller_listener(
 
     def _poll():
         xi_state = XINPUT_STATE()
+        prev_hide_active = False
         while True:
             result = xinput.XInputGetState(controller_index, ctypes.byref(xi_state))
             if result == 0:   # ERROR_SUCCESS
                 gp = xi_state.Gamepad
+                buttons = gp.wButtons
                 state.lt_pct     = _trigger_pct(gp.bLeftTrigger)
                 state.rt_pct     = _trigger_pct(gp.bRightTrigger)
-                state.shift_up   = bool(gp.wButtons & shift_up_button)
-                state.shift_down = bool(gp.wButtons & shift_down_button)
-                state.clutch     = bool(gp.wButtons & clutch_button) if clutch_button else False
+                state.shift_up   = bool(buttons & shift_up_button)
+                state.shift_down = bool(buttons & shift_down_button)
+                state.clutch     = bool(buttons & clutch_button) if clutch_button else False
                 state.connected  = True
+
+                hide_active = hide_button != 0 and (buttons & hide_button) == hide_button
+                state.toggle_hide = hide_active and not prev_hide_active
+                prev_hide_active = hide_active
+
                 time.sleep(_POLL_S)
             else:
-                state.connected = False
+                state.connected   = False
+                state.toggle_hide = False
+                prev_hide_active  = False
                 time.sleep(_RETRY_S)
 
     threading.Thread(target=_poll, daemon=True).start()
