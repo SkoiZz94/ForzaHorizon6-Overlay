@@ -74,14 +74,16 @@ def start_controller_listener(
                 state.connected  = True
 
                 hide_active = hide_button != 0 and (buttons & hide_button) == hide_button
-                state.toggle_hide = hide_active and not prev_hide_active
+                if hide_active and not prev_hide_active:
+                    state.toggle_hide = True
+                # toggle_hide is NOT cleared here; _tick in overlay.py consumes and clears it
                 prev_hide_active = hide_active
 
                 time.sleep(_POLL_S)
             else:
                 state.connected   = False
-                state.toggle_hide = False
                 prev_hide_active  = False
                 time.sleep(_RETRY_S)
 
-    threading.Thread(target=_poll, daemon=True).start()
+    t = threading.Thread(target=_poll, daemon=True, name="XInputPoller")
+    t.start()

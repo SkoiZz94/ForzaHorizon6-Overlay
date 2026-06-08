@@ -1,118 +1,146 @@
 import signal
 import sys
+import time
+import traceback
+import datetime
 from pathlib import Path
 
-from PyQt6.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu
-from PyQt6.QtCore import Qt, QTimer, QRect, QPointF
-from PyQt6.QtGui import (QPainter, QColor, QFont, QLinearGradient, QBrush,
-                          QKeySequence, QShortcut, QIcon, QPixmap)
+from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMessageBox,
+                             QWidget, QPushButton)
+from PyQt6.QtQuick   import QQuickWindow, QQuickPaintedItem
+from PyQt6.QtCore    import Qt, QSizeF, QPoint, QRectF, QTimer
+from PyQt6.QtGui     import (QPainter, QColor, QFont, QIcon, QPixmap, QGuiApplication)
 
-from telemetry import TelemetryState, start_udp_listener, lights_state, COLOR_UNLIT
-from telemetry import NUM_LIGHTS, SHIFT_RATIO, COLOR_GREEN, COLOR_YELLOW, COLOR_RED
+from telemetry  import TelemetryState, start_udp_listener
 from controller import ControllerState, start_controller_listener
-from config import Config, save_config, CONFIG_PATH
+from config     import Config, save_config, CONFIG_PATH
 
-TOP_MARGIN   = 10
-UPDATE_MS    = 50
-
-# Rev lights
-LIGHT_SIZE   = 44
-LIGHT_GAP    = 7
-GLOW_PAD     = 16
-
-# Controller widget
-BAR_W        = 90
-BAR_H        = 18
-BAR_GAP      = 6
-CENTER_W     = 28
-SHIFT_H      = 12
-GEAR_H       = 22
-CTR_HEIGHT   = SHIFT_H + 2 + GEAR_H + 2 + SHIFT_H   # = 50
-
-# Layout
-SECTION_GAP  = 14
-DIVIDER_W    = 1
-
-SHIFT_FADE_MS = 300
-
-# Ghost handles
-HANDLE_W       = 22
-HANDLE_H       = 22
-HANDLE_GAP     = 3
-HANDLE_R       = 4
-HANDLE_MARGIN  = 6
-HANDLE_STRIP_W = HANDLE_MARGIN + HANDLE_W + 4   # 32 logical px added to widget width
-
-SCALE_MIN = 0.5
-SCALE_MAX = 3.0
+SHIFT_FADE_MS  = 300
+_FLASH_HALF_MS = 80
 
 
-class TopBarOverlay(QWidget):
-    def __init__(self, tel: TelemetryState, ctrl: ControllerState,
-                 config: Config, config_path: Path):
+def _acquire_single_instance() -> bool:
+    """Return False if another instance is already running (Windows named mutex)."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW(None, False, "Global\\FH6OverlaySingleInstance")
+    return kernel32.GetLastError() != 183   # 183 = ERROR_ALREADY_EXISTS
+
+
+def _install_qt_message_handler() -> None:
+    """Intercept Qt warnings.
+
+    Suppresses the QFont::setPointSize <= 0 console spam and instead writes
+    a Python traceback to fh6overlay.log so the exact call site can be found.
+    All other Qt messages are forwarded to stderr unchanged.
+    """
+    from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
+
+    log_path = (
+        Path(sys.executable).parent / "fh6overlay.log"
+        if getattr(sys, "frozen", False)
+        else Path(__file__).parent / "fh6overlay.log"
+    )
+
+    def _handler(msg_type, context, message):
+        if "QFont::setPointSize: Point size <= 0" in message:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*60}\n{datetime.datetime.now()} [QFont size warning]\n"
+                            f"{message}\n")
+                    traceback.print_stack(file=f)
+            except Exception:
+                pass
+            return  # suppress console output
+        if "QDxgiVSyncService not destroyed in time" in message:
+            return  # cosmetic cleanup-timing warning; render thread races static dtor
+        if msg_type in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg,
+                        QtMsgType.QtFatalMsg):
+            print(message, file=sys.stderr)
+
+    qInstallMessageHandler(_handler)
+
+
+def _install_exception_handler() -> None:
+    log_path = (
+        Path(sys.executable).parent / "fh6overlay.log"
+        if getattr(sys, "frozen", False)
+        else Path(__file__).parent / "fh6overlay.log"
+    )
+
+    def _handler(exc_type, exc_value, exc_tb):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n{datetime.datetime.now()}\n")
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        except Exception:
+            pass
+        msg = QMessageBox()
+        msg.setWindowTitle("FH6 Overlay — unexpected error")
+        msg.setText(
+            f"An unexpected error occurred. The overlay must close.\n\n"
+            f"Log saved to:\n{log_path}"
+        )
+        msg.setDetailedText(
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        )
+        msg.exec()
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _handler
+
+
+def _log_error(location: str) -> None:
+    log_path = (
+        Path(sys.executable).parent / "fh6overlay.log"
+        if getattr(sys, "frozen", False)
+        else Path(__file__).parent / "fh6overlay.log"
+    )
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n{datetime.datetime.now()} [{location}]\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+
+
+class _GridOverlay(QQuickPaintedItem):
+    """Semi-transparent grid overlay rendered behind elements during edit mode."""
+
+    _GRID = 8
+
+    def paint(self, p: QPainter) -> None:
+        w, h = int(self.width()), int(self.height())
+        g = self._GRID
+        # Minor grid lines (very subtle)
+        p.setPen(QColor(255, 255, 255, 18))
+        for x in range(0, w + g, g):
+            p.drawLine(x, 0, x, h)
+        for y in range(0, h + g, g):
+            p.drawLine(0, y, w, y)
+        # Major grid lines every 5 cells (slightly brighter)
+        p.setPen(QColor(255, 255, 255, 42))
+        step = g * 5
+        for x in range(0, w + step, step):
+            p.drawLine(x, 0, x, h)
+        for y in range(0, h + step, step):
+            p.drawLine(0, y, w, y)
+
+
+class _HoverControls(QWidget):
+    """Ghost-handle strip: always-on-top thin strip that reveals Settings/Close on hover."""
+
+    _FULL_W  = 36
+    _BTN_W   = 28
+    _BTN_H   = 28
+    _BTN_GAP = 4
+    _PAD     = 6
+    _HEIGHT  = _PAD + _BTN_H + _BTN_GAP + _BTN_H + _PAD   # 72
+
+    def __init__(self, on_settings, on_close):
         super().__init__()
-        self._tel = tel
-        self._ctrl = ctrl
-        self._config = config
-        self._config_path = config_path
-        self._flash_on = True
-        self._flash_tick = 0
-        self._up_fade: float = 0.0
-        self._dn_fade: float = 0.0
-        self._scale: float = config.overlay_scale
-        self._handles_visible: bool = False
-        self._hovered_handle: str | None = None
-        self._drag_mode: str | None = None
-        self._drag_offset = None
-        self._resize_start_x: float = 0.0
-        self._resize_start_scale: float = 1.0
-        self._content_w: int = 0
-        self._content_h: int = 0
-        self._settings_panel = None
-        self._setup_window()
-        self._start_timer()
-
-    def _ctrl_width(self) -> int:
-        cfg = self._config
-        has = (cfg.show_brake_bar or cfg.show_gear
-               or cfg.show_shift_indicators or cfg.show_throttle_bar)
-        if not has:
-            return 0
-        w = 0
-        if cfg.show_brake_bar:
-            w += BAR_W + BAR_GAP
-        if cfg.show_gear or cfg.show_shift_indicators:
-            w += CENTER_W + BAR_GAP
-        if cfg.show_throttle_bar:
-            w += BAR_W + BAR_GAP
-        return max(w - BAR_GAP, 0)
-
-    def _compute_content_size(self) -> tuple[int, int]:
-        cfg = self._config
-        sections = []
-        if cfg.show_rev_lights:
-            rev_w = NUM_LIGHTS * LIGHT_SIZE + (NUM_LIGHTS - 1) * LIGHT_GAP
-            sections.append(rev_w)
-        cw = self._ctrl_width()
-        if cw > 0:
-            sections.append(cw)
-        if len(sections) == 2:
-            w = (GLOW_PAD + sections[0] + SECTION_GAP
-                 + DIVIDER_W + SECTION_GAP + sections[1] + GLOW_PAD)
-        elif len(sections) == 1:
-            w = GLOW_PAD + sections[0] + GLOW_PAD
-        else:
-            w = 2 * GLOW_PAD
-        h_candidates = []
-        if cfg.show_rev_lights:
-            h_candidates.append(LIGHT_SIZE)
-        if cw > 0:
-            h_candidates.append(CTR_HEIGHT)
-        h = (max(h_candidates) if h_candidates else 0) + 2 * GLOW_PAD
-        min_handle_h = 4 * HANDLE_H + 3 * HANDLE_GAP + 4
-        return w, max(h, 2 * GLOW_PAD, min_handle_h)
-
-    def _setup_window(self):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -120,350 +148,327 @@ class TopBarOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
-        self._apply_layout()
+        self.setFixedSize(self._FULL_W, self._HEIGHT)
 
-    def _apply_layout(self):
-        cw, ch = self._compute_content_size()
-        self._content_w = cw
-        self._content_h = ch
-        lw = cw + HANDLE_STRIP_W
-        self.setFixedSize(int(lw * self._scale), int(ch * self._scale))
-        cfg = self._config
-        if cfg.overlay_x == -1:
-            screen = QApplication.primaryScreen().geometry()
-            x = (screen.width() - int(lw * self._scale)) // 2
-            self.move(x, cfg.overlay_y)
-        else:
-            self.move(cfg.overlay_x, cfg.overlay_y)
+        _ss_base = (
+            "QPushButton { background: rgba(51,65,85,160); color: rgba(255,255,255,210);"
+            " border: none; border-radius: 5px; font-size: 14px; }"
+            " QPushButton:hover { background: rgba(99,102,241,220); }"
+        )
+        _ss_close = (
+            "QPushButton { background: rgba(51,65,85,160); color: rgba(255,255,255,210);"
+            " border: none; border-radius: 5px; font-size: 12px; }"
+            " QPushButton:hover { background: rgba(220,38,38,220); }"
+        )
 
-    # ── Task 5: ghost handle hit-testing ────────────────────────────────────
+        self._settings_btn = QPushButton("⚙", self)
+        self._settings_btn.setFixedSize(self._BTN_W, self._BTN_H)
+        self._settings_btn.move(4, self._PAD)
+        self._settings_btn.setStyleSheet(_ss_base)
+        self._settings_btn.clicked.connect(on_settings)
+        self._settings_btn.hide()
 
-    def _handle_at(self, pos) -> str | None:
-        s = self._scale
-        lx = pos.x() / s
-        ly = pos.y() / s
-        hx = self._content_w + HANDLE_MARGIN
-        if not (hx <= lx <= hx + HANDLE_W):
-            return None
-        total_h = 4 * HANDLE_H + 3 * HANDLE_GAP
-        y0 = (self._content_h - total_h) // 2
-        for i, name in enumerate(("move", "resize", "settings", "close")):
-            hy = y0 + i * (HANDLE_H + HANDLE_GAP)
-            if hy <= ly < hy + HANDLE_H:
-                return name
-        return None
+        self._close_btn = QPushButton("✕", self)
+        self._close_btn.setFixedSize(self._BTN_W, self._BTN_H)
+        self._close_btn.move(4, self._PAD + self._BTN_H + self._BTN_GAP)
+        self._close_btn.setStyleSheet(_ss_close)
+        self._close_btn.clicked.connect(on_close)
+        self._close_btn.hide()
 
     def enterEvent(self, event):
-        self._handles_visible = True
+        self._settings_btn.show()
+        self._close_btn.show()
         self.update()
 
     def leaveEvent(self, event):
-        if self._drag_mode is None:
-            self._handles_visible = False
-            self._hovered_handle = None
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if self._drag_mode is None:
-            prev = self._hovered_handle
-            self._hovered_handle = self._handle_at(event.position())
-            if self._hovered_handle != prev:
-                self.update()
-        elif self._drag_mode == "move":
-            self.move((event.globalPosition() - self._drag_offset).toPoint())
-        elif self._drag_mode == "resize":
-            delta = event.globalPosition().x() - self._resize_start_x
-            new_scale = self._resize_start_scale + delta / 300.0
-            new_scale = max(SCALE_MIN, min(SCALE_MAX, new_scale))
-            if abs(new_scale - self._scale) > 0.001:
-                self._scale = new_scale
-                self._apply_layout()
-
-    # ── Task 6: mouse press/release + scale-aware paintEvent ────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        handle = self._handle_at(event.position())
-        if handle == "move":
-            self._drag_mode = "move"
-            self._drag_offset = event.globalPosition() - QPointF(self.pos())
-        elif handle == "resize":
-            self._drag_mode = "resize"
-            self._resize_start_x = event.globalPosition().x()
-            self._resize_start_scale = self._scale
-        elif handle == "settings":
-            self._open_settings()
-        elif handle == "close":
-            QApplication.instance().quit()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        if self._drag_mode == "move":
-            self._config.overlay_x = self.x()
-            self._config.overlay_y = self.y()
-            save_config(self._config_path, self._config)
-        elif self._drag_mode == "resize":
-            self._config.overlay_scale = round(self._scale, 3)
-            save_config(self._config_path, self._config)
-        self._drag_mode = None
+        self._settings_btn.hide()
+        self._close_btn.hide()
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-        s = self._scale
-        painter.save()
-        painter.scale(s, s)
-
-        cfg = self._config
-        cy = self._content_h // 2
-
-        # Rev lights — hidden during flash-off phase
-        if not (self._tel.ratio >= SHIFT_RATIO and not self._flash_on):
-            if cfg.show_rev_lights:
-                self._draw_rev_lights(painter, GLOW_PAD, cy)
-
-        # Divider (only when both sections are visible)
-        if cfg.show_rev_lights and self._ctrl_width() > 0:
-            rev_w = NUM_LIGHTS * LIGHT_SIZE + (NUM_LIGHTS - 1) * LIGHT_GAP
-            div_x = GLOW_PAD + rev_w + SECTION_GAP
-            painter.setPen(QColor(51, 65, 85, 100))
-            painter.drawLine(div_x, cy - LIGHT_SIZE // 2, div_x, cy + LIGHT_SIZE // 2)
-            painter.setPen(Qt.PenStyle.NoPen)
-            ctrl_x = div_x + DIVIDER_W + SECTION_GAP
-        elif self._ctrl_width() > 0:
-            ctrl_x = GLOW_PAD
-        else:
-            ctrl_x = None
-
-        if ctrl_x is not None:
-            self._draw_controller(painter, ctrl_x, cy)
-
-        # Keep handle strip hit-testable: 1-alpha fill so Windows delivers mouse
-        # events even when handles aren't drawn (transparent pixels get no events)
         painter.setPen(Qt.PenStyle.NoPen)
+        # Alpha=1 fill so Windows delivers mouse events on otherwise-transparent pixels
         painter.setBrush(QColor(0, 0, 0, 1))
-        painter.drawRect(self._content_w, 0, HANDLE_STRIP_W, self._content_h)
-
-        # Handles drawn in logical coords (inside scale transform)
-        if self._handles_visible:
-            self._draw_handles(painter)
-
-        painter.restore()
+        painter.drawRect(self.rect())
+        w, h = self.width(), self.height()
+        if not self._settings_btn.isVisible():
+            # Collapsed: subtle right-edge strip indicator
+            painter.setBrush(QColor(100, 116, 139, 90))
+            painter.drawRoundedRect(w - 5, 0, 5, h, 2, 2)
+        else:
+            # Expanded: dark background panel
+            painter.setBrush(QColor(10, 15, 30, 192))
+            painter.drawRoundedRect(0, 0, w, h, 6, 6)
         painter.end()
 
-    def _draw_handles(self, painter: QPainter) -> None:
-        total_h = 4 * HANDLE_H + 3 * HANDLE_GAP
-        y0 = (self._content_h - total_h) // 2
-        hx = self._content_w + HANDLE_MARGIN
-        icons = ("⣿", "⟺", "⚙", "✕")
-        names = ("move", "resize", "settings", "close")
-        for i, (icon, name) in enumerate(zip(icons, names)):
-            hy = y0 + i * (HANDLE_H + HANDLE_GAP)
-            is_hovered = self._hovered_handle == name
-            bg = QColor(220, 38, 38, 160) if is_hovered else QColor(51, 65, 85, 140)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bg)
-            painter.drawRoundedRect(hx, hy, HANDLE_W, HANDLE_H, HANDLE_R, HANDLE_R)
-            painter.setPen(QColor(255, 255, 255, 210))
-            painter.setFont(QFont("Segoe UI Symbol", 9))
-            painter.drawText(
-                QRect(hx, hy, HANDLE_W, HANDLE_H),
-                Qt.AlignmentFlag.AlignCenter,
-                icon,
-            )
 
-    def _draw_rev_lights(self, painter: QPainter, x: int, cy: int) -> None:
-        cfg = self._config
-        colour_map = {
-            COLOR_GREEN:  cfg.colour_rev_zone1,
-            COLOR_YELLOW: cfg.colour_rev_zone2,
-            COLOR_RED:    cfg.colour_rev_zone3,
+class OverlayWindow(QQuickWindow):
+    def __init__(self, tel: TelemetryState, ctrl: ControllerState,
+                 config: Config, config_path: Path):
+        QQuickWindow.setDefaultAlphaBuffer(True)
+        super().__init__()
+
+        self._tel         = tel
+        self._ctrl        = ctrl
+        self._config      = config
+        self._config_path = config_path
+
+        # Animation state
+        self._flash_on:     bool  = True
+        self._flash_active: bool  = False
+        self._up_fade:      float = 0.0
+        self._dn_fade:      float = 0.0
+        self._cal_flash_until: float = 0.0
+        self._last_tick_time:  float = time.monotonic()
+
+        # Edit Layout mode
+        self._edit_mode: bool             = False
+        self._layout_snapshot: dict       = {}
+        self._elements_panel              = None
+        self._grid_overlay                = None
+        self._reopen_settings_on_exit: bool = False
+        self._settings_panel              = None
+        self._hover_controls              = None
+
+        self.setFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setColor(QColor(0, 0, 0, 0))
+
+        # Full-screen on primary display
+        screen = QGuiApplication.primaryScreen().geometry()
+        self.setGeometry(screen.x(), screen.y(), screen.width(), screen.height())
+
+        # Create all element items as children of the content item
+        from elements import (RPMItem, BrakeItem, ThrottleItem,
+                              GearItem, ShiftUpItem, ShiftDnItem)
+        ci = self.contentItem()
+        self._rpm      = RPMItem(self, ci)
+        self._brake    = BrakeItem(self, ci)
+        self._throttle = ThrottleItem(self, ci)
+        self._gear     = GearItem(self, ci)
+        self._shift_up = ShiftUpItem(self, ci)
+        self._shift_dn = ShiftDnItem(self, ci)
+        self._elements = [self._rpm, self._brake, self._throttle,
+                          self._gear, self._shift_up, self._shift_dn]
+        self._element_keys = ["rpm", "brake", "throttle", "gear", "shift_up", "shift_dn"]
+
+        self._apply_default_layout()
+        self._sync_element_geometry()
+        self._sync_visibility()
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(16)   # ~60 fps
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start()
+
+        # Ghost-handle hover controls (Settings + Close)
+        from PyQt6.QtWidgets import QApplication as _QApp
+        hc = _HoverControls(self._open_settings, _QApp.instance().quit)
+        sc = QGuiApplication.primaryScreen().geometry()
+        hc.move(
+            sc.x() + sc.width() // 2 + 420,
+            sc.y() + 10,
+        )
+        hc.show()
+        self._hover_controls = hc
+
+    # ── Default layout ───────────────────────────────────────────────────────
+
+    def _apply_default_layout(self) -> None:
+        """Set default positions (and sizes) for elements that still have x == -1."""
+        screen = QGuiApplication.primaryScreen().geometry()
+        sw = screen.width()
+        cx = sw // 2
+        # Horizontal layout matches the old TopBarOverlay (overlay_y=10):
+        #   RPM lights span the left-of-center region (old center x: cx-137)
+        #   Brake | Gear column | Throttle span the right-of-center region
+        # Vertical:  shift_up above gear, gear in middle, shift_dn below
+        #   y=10 to y=142 compact top band (old band was y=35-85, new elements are larger)
+        defaults = {
+            # Sizes approximate old TopBarOverlay proportions; all center on cy=32 from top
+            # (old overlay: overlay_y=10, cy=50 within 101px-high widget → screen cy=60)
+            # key: (x, y, w, h)
+            "rpm":      (max(0, cx - 387), 10,  500, 44),  # right: cx+113, center_y=32
+            "brake":    (cx + 118,         22,  100, 20),  # right: cx+218, center_y=32
+            "shift_up": (cx + 223,          0,   40, 14),  # above gear
+            "gear":     (cx + 223,         16,   40, 32),  # right: cx+263, center_y=32
+            "shift_dn": (cx + 223,         50,   40, 14),  # below gear
+            "throttle": (cx + 268,         22,  100, 20),  # right: cx+368, center_y=32
         }
-        colours = lights_state(self._tel.ratio, self._tel.connected)
-        y = cy - LIGHT_SIZE // 2
-        for c in colours:
-            self._draw_light(painter, x, y, colour_map.get(c, c))
-            x += LIGHT_SIZE + LIGHT_GAP
-
-    def _draw_controller(self, painter: QPainter, x: int, cy: int) -> None:
-        c = self._ctrl
         cfg = self._config
+        for key, (dx, dy, dw, dh) in defaults.items():
+            if getattr(cfg, f"{key}_x") == -1:
+                setattr(cfg, f"{key}_x", max(0, dx))
+                setattr(cfg, f"{key}_y", max(0, dy))
+                setattr(cfg, f"{key}_w", dw)
+                setattr(cfg, f"{key}_h", dh)
 
-        # ── Brake bar ────────────────────────────────────────────────────────
-        if cfg.show_brake_bar:
-            bk_y = cy - BAR_H // 2
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#1e293b"))
-            painter.drawRoundedRect(x, bk_y, BAR_W, BAR_H, 4, 4)
-            fill_w = max(0, int(BAR_W * c.lt_pct / 100))
-            if fill_w:
-                grad = QLinearGradient(x, 0, x + BAR_W, 0)
-                grad.setColorAt(0.0, QColor(cfg.colour_brake_start))
-                grad.setColorAt(1.0, QColor(cfg.colour_brake_end))
-                painter.save()
-                painter.setClipRect(x, bk_y, fill_w, BAR_H)
-                painter.setBrush(QBrush(grad))
-                painter.drawRoundedRect(x, bk_y, BAR_W, BAR_H, 4, 4)
-                painter.restore()
-            if cfg.show_brake_label and c.lt_pct > 0:
-                painter.setPen(QColor(255, 255, 255))
-                painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-                painter.drawText(QRect(x, bk_y, BAR_W - 3, BAR_H),
-                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                                 f"{c.lt_pct}%")
-            x += BAR_W + BAR_GAP
+    def _sync_element_geometry(self) -> None:
+        """Push x/y/w/h from config onto each element item."""
+        cfg = self._config
+        for item, key in zip(self._elements, self._element_keys):
+            item.setX(getattr(cfg, f"{key}_x"))
+            item.setY(getattr(cfg, f"{key}_y"))
+            item.setSize(QSizeF(getattr(cfg, f"{key}_w"), getattr(cfg, f"{key}_h")))
 
-        # ── Centre column ────────────────────────────────────────────────────
-        if cfg.show_gear or cfg.show_shift_indicators:
-            col_x = x
-            top_y = cy - CTR_HEIGHT // 2
-
-            if cfg.show_shift_indicators:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self._shift_color(self._up_fade))
-                painter.drawRoundedRect(col_x, top_y, CENTER_W, SHIFT_H, 2, 2)
-                painter.setPen(QColor("#1a1200") if self._up_fade > 0.5 else QColor("#4b5563"))
-                painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-                painter.drawText(QRect(col_x, top_y, CENTER_W, SHIFT_H),
-                                 Qt.AlignmentFlag.AlignCenter, "▲")
-
-            gear_y = top_y + SHIFT_H + 2
-            if cfg.show_gear:
-                painter.setPen(Qt.PenStyle.NoPen)
-                if self._ctrl.clutch:
-                    painter.setBrush(self._shift_color(1.0))
-                    painter.drawRoundedRect(col_x, gear_y, CENTER_W, GEAR_H, 3, 3)
-                    painter.setPen(QColor("#1a1200"))
-                    painter.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
-                    painter.drawText(QRect(col_x, gear_y, CENTER_W, GEAR_H),
-                                     Qt.AlignmentFlag.AlignCenter, "C")
-                else:
-                    painter.setBrush(QColor(cfg.colour_gear_bg))
-                    painter.drawRoundedRect(col_x, gear_y, CENTER_W, GEAR_H, 3, 3)
-                    if not self._tel.connected:
-                        gear_label = "–"
-                    elif self._tel.display_gear == 0:
-                        gear_label = "R"
-                    elif self._tel.is_electric:
-                        gear_label = "D"
-                    else:
-                        gear_label = str(self._tel.display_gear)
-                    painter.setPen(QColor(cfg.colour_gear_text))
-                    painter.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
-                    painter.drawText(QRect(col_x, gear_y, CENTER_W, GEAR_H),
-                                     Qt.AlignmentFlag.AlignCenter, gear_label)
-
-            if cfg.show_shift_indicators:
-                dn_y = gear_y + GEAR_H + 2
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self._shift_color(self._dn_fade))
-                painter.drawRoundedRect(col_x, dn_y, CENTER_W, SHIFT_H, 2, 2)
-                painter.setPen(QColor("#1a1200") if self._dn_fade > 0.5 else QColor("#4b5563"))
-                painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-                painter.drawText(QRect(col_x, dn_y, CENTER_W, SHIFT_H),
-                                 Qt.AlignmentFlag.AlignCenter, "▼")
-
-            x += CENTER_W + BAR_GAP
-
-        # ── Throttle bar ─────────────────────────────────────────────────────
-        if cfg.show_throttle_bar:
-            th_y = cy - BAR_H // 2
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#1e293b"))
-            painter.drawRoundedRect(x, th_y, BAR_W, BAR_H, 4, 4)
-            fill_w = max(0, int(BAR_W * c.rt_pct / 100))
-            if fill_w:
-                fill_x = x + BAR_W - fill_w
-                grad = QLinearGradient(fill_x + fill_w, 0, fill_x, 0)
-                grad.setColorAt(0.0, QColor(cfg.colour_throttle_start))
-                grad.setColorAt(1.0, QColor(cfg.colour_throttle_end))
-                painter.save()
-                painter.setClipRect(fill_x, th_y, fill_w, BAR_H)
-                painter.setBrush(QBrush(grad))
-                painter.drawRoundedRect(x, th_y, BAR_W, BAR_H, 4, 4)
-                painter.restore()
-            if cfg.show_throttle_label and c.rt_pct > 0:
-                painter.setPen(QColor(255, 255, 255))
-                painter.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-                painter.drawText(QRect(x + 3, th_y, BAR_W - 3, BAR_H),
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                 f"{c.rt_pct}%")
-
-    def _draw_light(self, painter: QPainter, x: int, y: int, color_hex: str) -> None:
-        painter.setPen(Qt.PenStyle.NoPen)
-        if color_hex == COLOR_UNLIT:
-            painter.setBrush(QColor(color_hex))
-            painter.drawEllipse(x, y, LIGHT_SIZE, LIGHT_SIZE)
-            return
-        c = QColor(color_hex)
-        r, g, b = c.red(), c.green(), c.blue()
-        # glow halos — outer (faint) to inner (stronger)
-        for extra, alpha in ((14, 18), (9, 38), (5, 65)):
-            half = extra // 2
-            painter.setBrush(QColor(r, g, b, alpha))
-            painter.drawEllipse(x - half, y - half, LIGHT_SIZE + extra, LIGHT_SIZE + extra)
-        # main light
-        painter.setBrush(QColor(color_hex))
-        painter.drawEllipse(x, y, LIGHT_SIZE, LIGHT_SIZE)
-
-    def _shift_color(self, fade: float) -> QColor:
-        """Interpolate between dark background and config shift-active colour based on fade (0–1)."""
-        active = QColor(self._config.colour_shift_active)
-        bg = QColor("#1e293b")
-        r = int(bg.red()   + (active.red()   - bg.red())   * fade)
-        g = int(bg.green() + (active.green() - bg.green()) * fade)
-        b = int(bg.blue()  + (active.blue()  - bg.blue())  * fade)
-        return QColor(r, g, b)
-
-    def _start_timer(self):
-        timer = QTimer(self)
-        timer.timeout.connect(self._tick)
-        timer.start(UPDATE_MS)
-
-    def _tick(self):
-        self._tel.check_timeout()
-
-        if self._tel.ratio >= SHIFT_RATIO:
-            self._flash_tick += 1
-            if self._flash_tick >= 3:
-                self._flash_on = not self._flash_on
-                self._flash_tick = 0
-        else:
-            self._flash_on = True
-            self._flash_tick = 0
-
-        decay = UPDATE_MS / SHIFT_FADE_MS
-        self._up_fade = 1.0 if self._ctrl.shift_up else max(0.0, self._up_fade - decay)
-        self._dn_fade = 1.0 if self._ctrl.shift_down else max(0.0, self._dn_fade - decay)
-
-        if self._ctrl.toggle_hide:
-            if self.isVisible():
-                self.hide()
-            else:
-                self.show()
-
-        self.update()
+    def _sync_visibility(self) -> None:
+        cfg = self._config
+        self._rpm.setVisible(cfg.show_rev_lights)
+        self._brake.setVisible(cfg.show_brake_bar)
+        self._throttle.setVisible(cfg.show_throttle_bar)
+        self._gear.setVisible(cfg.show_gear)
+        self._shift_up.setVisible(cfg.show_shift_indicators)
+        self._shift_dn.setVisible(cfg.show_shift_indicators)
 
     def apply_config(self) -> None:
-        self._scale = self._config.overlay_scale
-        self._apply_layout()
-        self.update()
+        try:
+            self._sync_element_geometry()
+            self._sync_visibility()
+            for el in self._elements:
+                el.update()
+        except Exception:
+            _log_error("apply_config")
 
-    def _open_settings(self):
+    # ── Edit mode ────────────────────────────────────────────────────────────
+
+    def toggle_edit_mode(self, reopen_settings: bool = False) -> None:
+        if self._edit_mode:
+            self._apply_layout()
+            return
+        self._edit_mode = True
+        self._reopen_settings_on_exit = reopen_settings
+        cfg = self._config
+        self._layout_snapshot = {
+            f"{key}_{dim}": getattr(cfg, f"{key}_{dim}")
+            for key in self._element_keys
+            for dim in ("x", "y", "w", "h")
+        }
+        self.hide()
+        self.setFlag(Qt.WindowType.WindowTransparentForInput, False)
+        for el in self._elements:
+            el.setVisible(True)
+        self.show()
+        for el in self._elements:
+            el.update()
+
+        # Grid overlay — rendered behind all elements (z = -1)
+        screen = QGuiApplication.primaryScreen().geometry()
+        grid = _GridOverlay(self.contentItem())
+        grid.setX(0)
+        grid.setY(0)
+        grid.setSize(QSizeF(screen.width(), screen.height()))
+        grid.setZ(-1)
+        grid.setVisible(True)
+        self._grid_overlay = grid
+
+        # Appearance panel with Apply / Cancel
+        from settings_panel import ElementsPanel
+        ep = ElementsPanel(
+            self._config, self._config_path, self,
+            on_apply=self._apply_layout,
+            on_cancel=self._cancel_layout,
+        )
+        ep.show()
+        self._elements_panel = ep
+
+        if self._hover_controls is not None:
+            self._hover_controls.hide()
+
+    def _apply_layout(self) -> None:
+        cfg = self._config
+        for el, key in zip(self._elements, self._element_keys):
+            setattr(cfg, f"{key}_x", int(el.x()))
+            setattr(cfg, f"{key}_y", int(el.y()))
+            setattr(cfg, f"{key}_w", int(el.width()))
+            setattr(cfg, f"{key}_h", int(el.height()))
+        save_config(self._config_path, cfg)
+        self._exit_edit_mode()
+
+    def _cancel_layout(self) -> None:
+        for key, val in self._layout_snapshot.items():
+            setattr(self._config, key, val)
+        self._sync_element_geometry()
+        self._exit_edit_mode()
+
+    def _exit_edit_mode(self) -> None:
+        self._edit_mode = False
+        if self._grid_overlay is not None:
+            self._grid_overlay.setVisible(False)
+            self._grid_overlay.setParentItem(None)
+            self._grid_overlay.deleteLater()
+            self._grid_overlay = None
+        if self._elements_panel is not None:
+            self._elements_panel.close()
+            self._elements_panel = None
+        self.hide()
+        self.setFlag(Qt.WindowType.WindowTransparentForInput, True)
+        self._sync_visibility()
+        self.show()
+        for el in self._elements:
+            el.update()
+        if self._hover_controls is not None:
+            self._hover_controls.show()
+        if self._reopen_settings_on_exit:
+            self._reopen_settings_on_exit = False
+            self._open_settings()
+
+    # ── Settings ─────────────────────────────────────────────────────────────
+
+    def _open_settings(self) -> None:
         from settings_panel import SettingsPanel
-        if self._settings_panel is None or not self._settings_panel.isVisible():
+        if self._settings_panel is None:
             self._settings_panel = SettingsPanel(
                 self._config, self._config_path, self._tel, self
             )
         self._settings_panel.show()
         self._settings_panel.raise_()
+
+    # ── Tick loop ────────────────────────────────────────────────────────────
+
+    def _tick(self) -> None:
+        try:
+            self._tick_impl()
+        except Exception:
+            _log_error("_tick")
+
+    def _tick_impl(self) -> None:
+        now   = time.monotonic()
+        dt_ms = (now - self._last_tick_time) * 1000
+        self._last_tick_time = now
+
+        self._tel.check_timeout()
+
+        if self._tel.calibration_updated:
+            self._tel.calibration_updated = False
+            self._cal_flash_until = now + 1.0
+
+        self._flash_on = int(now * 1000 / _FLASH_HALF_MS) % 2 == 0
+
+        ratio = self._tel.ratio
+        sr    = self._config.shift_ratio
+        if ratio >= sr:
+            self._flash_active = True
+        elif ratio < sr * 0.94:
+            self._flash_active = False
+
+        decay = dt_ms / SHIFT_FADE_MS
+        self._up_fade = 1.0 if self._ctrl.shift_up   else max(0.0, self._up_fade - decay)
+        self._dn_fade = 1.0 if self._ctrl.shift_down else max(0.0, self._dn_fade - decay)
+
+        if self._ctrl.toggle_hide and not self._edit_mode:
+            vis = not self._rpm.isVisible()
+            for el in self._elements:
+                el.setVisible(vis)
+            if self._hover_controls is not None:
+                self._hover_controls.setVisible(vis)
+            self._ctrl.toggle_hide = False
+
+        for el in self._elements:
+            el.update()
 
 
 def _tray_icon() -> QIcon:
@@ -480,25 +485,32 @@ def _tray_icon() -> QIcon:
 
 def main():
     import argparse
-    from config import load_config, CONFIG_PATH
+    from config import load_config, CONFIG_PATH, VERSION
     from setup_wizard import SetupWizard
 
-    parser = argparse.ArgumentParser(description='FH6 rev light overlay')
-    parser.add_argument('--port', type=int, default=None,
-                        help='UDP port override (default: from config.ini)')
-    args = parser.parse_args()
+    _install_exception_handler()
+    _install_qt_message_handler()
 
-    # QApplication must exist before the wizard (both are PyQt6 windows)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    # U16: single instance — after QApplication so we can show a message
+    if not _acquire_single_instance():
+        QMessageBox.warning(None, "FH6 Overlay", "FH6 Overlay is already running.")
+        sys.exit(0)
 
     if not CONFIG_PATH.exists():
         wizard = SetupWizard(CONFIG_PATH)
         wizard.exec()
 
     config = load_config(CONFIG_PATH)
-    port   = args.port if args.port is not None else config.udp_port
+
+    parser = argparse.ArgumentParser(description="FH6 rev light overlay")
+    parser.add_argument("--port", type=int, default=None,
+                        help="UDP port override (default: from config.ini)")
+    args = parser.parse_args()
+    port = args.port if args.port is not None else config.udp_port
 
     tel  = TelemetryState()
     ctrl = ControllerState()
@@ -506,29 +518,43 @@ def main():
     try:
         start_udp_listener(tel, port)
     except OSError as e:
-        print(f"Error: could not bind to port {port}.")
-        print(f"Make sure no other instance of the overlay is already running.")
-        print(f"Details: {e}")
+        QMessageBox.critical(
+            None, "FH6 Overlay — port error",
+            f"Could not bind to UDP port {port}.\n\n"
+            f"Make sure no other instance is running.\n\nDetails: {e}"
+        )
         sys.exit(1)
 
     start_controller_listener(ctrl, config.shift_up_button,
                               config.shift_down_button, config.clutch_button,
                               config.hide_button)
 
-    tray = QSystemTrayIcon(_tray_icon(), parent=app)
-    tray.setToolTip("FH6 Overlay")
+    overlay = OverlayWindow(tel, ctrl, config, CONFIG_PATH)
+    overlay.show()
+
+    tray = QSystemTrayIcon(parent=app)
+    ico_path = Path(__file__).parent / "logo" / "SkoiZzLogo.ico"
+    if getattr(sys, "frozen", False):
+        ico_path = Path(sys._MEIPASS) / "logo" / "SkoiZzLogo.ico"
+    if ico_path.exists():
+        tray.setIcon(QIcon(str(ico_path)))
+    else:
+        tray.setIcon(_tray_icon())
+    tray.setToolTip(f"FH6 Overlay v{VERSION}")
     menu = QMenu()
+    menu.addAction("Settings",    overlay._open_settings)
+    menu.addAction("Edit Layout", overlay.toggle_edit_mode)
+    menu.addSeparator()
     menu.addAction("Quit", app.quit)
     tray.setContextMenu(menu)
     tray.show()
 
-    overlay = TopBarOverlay(tel, ctrl, config, CONFIG_PATH)
-
-    for seq in ("Escape", "Ctrl+Q"):
-        QShortcut(QKeySequence(seq), overlay, activated=app.quit)
-
-    overlay.show()
-    sys.exit(app.exec())
+    ret = app.exec()
+    # Close the QQuickWindow before sys.exit so the DXGI VSync render
+    # thread can finish cleanly before static destructors run.
+    overlay.close()
+    app.processEvents()
+    sys.exit(ret)
 
 
 if __name__ == "__main__":

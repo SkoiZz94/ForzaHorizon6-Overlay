@@ -1,13 +1,14 @@
 # settings_panel.py
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QFont, QColor, QDesktopServices, QPixmap,
                          QPainter, QPen, QLinearGradient, QBrush)
 from PyQt6.QtWidgets import (
-    QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QApplication, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QWidget, QLineEdit, QButtonGroup, QRadioButton,
-    QScrollArea,
+    QScrollArea, QComboBox,
 )
 
 from config import Config, save_config
@@ -175,7 +176,6 @@ class _ColourPicker(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header (draggable) ────────────────────────────────────────────────
         self._header = QFrame(objectName="cp_header")
         self._header.setFixedHeight(36)
         hl = QHBoxLayout(self._header)
@@ -196,7 +196,6 @@ class _ColourPicker(QDialog):
         self._header.mousePressEvent = self._hdr_press
         self._header.mouseMoveEvent  = self._hdr_move
 
-        # ── Body ──────────────────────────────────────────────────────────────
         body = QVBoxLayout()
         body.setContentsMargins(12, 12, 12, 12)
         body.setSpacing(10)
@@ -268,8 +267,6 @@ class _ColourPicker(QDialog):
 
         self._set_colour(initial)
 
-    # ── drag support ──────────────────────────────────────────────────────────
-
     def _hdr_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             from PyQt6.QtCore import QPointF
@@ -278,8 +275,6 @@ class _ColourPicker(QDialog):
     def _hdr_move(self, event):
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move((event.globalPosition() - self._drag_offset).toPoint())
-
-    # ── colour sync ───────────────────────────────────────────────────────────
 
     def _set_colour(self, colour: QColor):
         self._colour = QColor(colour)
@@ -352,6 +347,18 @@ QRadioButton { color: #e5e5e5; font-family: Consolas; font-size: 12px; spacing: 
 QRadioButton::indicator { width: 14px; height: 14px; border-radius: 7px;
     border: 2px solid #444; background: #111; }
 QRadioButton::indicator:checked { background: #dc2626; border-color: #dc2626; }
+QComboBox {
+    background: #111; color: #aaa; border: 1px solid #2a2a2a;
+    border-radius: 4px; padding: 3px 8px;
+    font-family: Consolas; font-size: 12px; min-width: 140px;
+}
+QComboBox:focus { border-color: #dc2626; }
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView {
+    background: #0f0f0f; color: #aaa; border: 1px solid #333;
+    selection-background-color: #dc2626; selection-color: white;
+    font-family: Consolas; font-size: 12px;
+}
 """
 
 _TOGGLE_ON  = "background:#dc2626; border-radius:8px; min-width:32px; max-width:32px; min-height:16px; max-height:16px; color:white; font-size:10px;"
@@ -395,7 +402,7 @@ class _Toggle(QPushButton):
 
 
 class _SwatchButton(QPushButton):
-    """Colour swatch that opens QColorDialog and writes to config."""
+    """Colour swatch that opens _ColourPicker and writes to config."""
 
     def __init__(self, config: Config, attr: str, on_change):
         super().__init__()
@@ -423,6 +430,37 @@ class _SwatchButton(QPushButton):
                 setattr(self._config, self._attr, colour.name())
                 self._refresh()
                 self._on_change()
+
+
+class _StyleDropdown(QWidget):
+    """Label + QComboBox that writes a style key to config and calls on_change."""
+
+    def __init__(self, label: str, config: Config, attr: str,
+                 choices: tuple, on_change):
+        super().__init__()
+        from config import STYLE_LABELS
+        self._config    = config
+        self._attr      = attr
+        self._on_change = on_change
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.addWidget(QLabel(label))
+        layout.addStretch()
+
+        self._combo = QComboBox()
+        for key in choices:
+            self._combo.addItem(STYLE_LABELS.get(key, key), userData=key)
+        current = getattr(config, attr)
+        idx = next((i for i in range(self._combo.count())
+                    if self._combo.itemData(i) == current), 0)
+        self._combo.setCurrentIndex(idx)
+        self._combo.currentIndexChanged.connect(self._on_index_changed)
+        layout.addWidget(self._combo)
+
+    def _on_index_changed(self, _):
+        setattr(self._config, self._attr, self._combo.currentData())
+        self._on_change()
 
 
 class _BindRow(QWidget):
@@ -487,10 +525,210 @@ class _BindRow(QWidget):
             self._on_change()
 
 
+# ── ElementsPanel ─────────────────────────────────────────────────────────────
+
+class ElementsPanel(QDialog):
+    """Appearance panel shown during Edit Layout mode.
+
+    Contains visibility toggles, style dropdowns, and colour swatches.
+    Apply / Cancel buttons exit edit mode and optionally reopen the Settings panel.
+    """
+
+    def __init__(self, config: Config, config_path: Path, overlay,
+                 on_apply, on_cancel):
+        super().__init__()
+        self._config      = config
+        self._config_path = config_path
+        self._overlay     = overlay
+        self._on_apply    = on_apply
+        self._on_cancel   = on_cancel
+        self._drag_offset = None
+
+        self.setWindowTitle("Overlay Appearance")
+        self.setFixedWidth(480)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setStyleSheet(_SS)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        header = QFrame(objectName="header")
+        header.setFixedHeight(40)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(16, 0, 16, 0)
+        title = QLabel("Overlay Appearance")
+        title.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        title.setStyleSheet("color: white; letter-spacing: 2px; background: transparent;")
+        hl.addWidget(title)
+        hl.addStretch()
+        root.addWidget(header)
+        header.mousePressEvent = self._hdr_press
+        header.mouseMoveEvent  = self._hdr_move
+
+        # ── Scrollable body ───────────────────────────────────────────────────
+        scroll = _ScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body_widget = QWidget()
+        self._body = QVBoxLayout(body_widget)
+        self._body.setContentsMargins(16, 16, 16, 16)
+        self._body.setSpacing(14)
+        scroll.setWidget(body_widget)
+        root.addWidget(scroll)
+
+        # ── Footer: Apply / Cancel ────────────────────────────────────────────
+        footer = QFrame()
+        footer.setStyleSheet("QFrame { background:#0a0a0a; border-top: 1px solid #1a1a1a; }")
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(16, 10, 16, 10)
+        fl.setSpacing(10)
+        fl.addStretch()
+        cancel_btn = QPushButton("✕  Cancel")
+        cancel_btn.setStyleSheet(
+            "QPushButton { background:#111; border:1px solid #ef4444; color:#ef4444;"
+            " border-radius:4px; padding:6px 20px; font-family:Consolas; font-size:12px; }"
+            " QPushButton:hover { background:#ef4444; color:white; border:none; }"
+        )
+        cancel_btn.clicked.connect(self._do_cancel)
+        fl.addWidget(cancel_btn)
+        apply_btn = QPushButton("✓  Apply")
+        apply_btn.setStyleSheet(
+            "QPushButton { background:#22c55e; border:none; color:white;"
+            " border-radius:4px; padding:6px 20px; font-family:Consolas; font-size:12px; }"
+            " QPushButton:hover { background:#16a34a; }"
+        )
+        apply_btn.clicked.connect(self._do_apply)
+        fl.addWidget(apply_btn)
+        root.addWidget(footer)
+
+        self._build_sections()
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        QShortcut(QKeySequence("Escape"), self, activated=self._do_cancel)
+        self.resize(480, 580)
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def _do_apply(self):
+        self._on_apply()
+
+    def _do_cancel(self):
+        self._on_cancel()
+
+    def _apply(self):
+        """Live-apply a config change (style/colour/visibility toggle)."""
+        save_config(self._config_path, self._config)
+        self._overlay.apply_config()
+
+    # ── Drag support ──────────────────────────────────────────────────────────
+
+    def _hdr_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.pos()
+
+    def _hdr_move(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        from PyQt6.QtGui import QGuiApplication
+        screen = QGuiApplication.primaryScreen().geometry()
+        x = screen.x() + (screen.width()  - self.width())  // 2
+        y = screen.y() + (screen.height() - self.height()) // 2
+        self.move(x, y)
+
+    # ── Sections ──────────────────────────────────────────────────────────────
+
+    def _build_sections(self):
+        hint = QLabel("Drag elements to move  ·  Drag ▼ grip to resize  ·  Snaps to 8 px grid")
+        hint.setStyleSheet("color: #475569; font-size: 11px; padding: 0 0 6px 0;")
+        hint.setWordWrap(True)
+        self._body.addWidget(hint)
+
+        self._add_visibility()
+        self._body.addWidget(_divider())
+        self._add_styles()
+        self._body.addWidget(_divider())
+        self._add_colours()
+        self._body.addStretch()
+
+    def _add_visibility(self):
+        self._body.addWidget(_section_label("Visibility"))
+        self._toggles: list[_Toggle] = []
+        toggles = [
+            ("Rev lights",             "show_rev_lights"),
+            ("Gear indicator",         "show_gear"),
+            ("Shift up / down",        "show_shift_indicators"),
+            ("Brake bar",              "show_brake_bar"),
+            ("Throttle bar",           "show_throttle_bar"),
+            ("Brake % label",          "show_brake_label"),
+            ("Throttle % label",       "show_throttle_label"),
+            ("Reverse brake bar",      "brake_bar_reversed"),
+            ("Reverse throttle bar",   "throttle_bar_reversed"),
+        ]
+        for label, attr in toggles:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addStretch()
+            t = _Toggle(self._config, attr, self._apply)
+            self._toggles.append(t)
+            row.addWidget(t)
+            self._body.addLayout(row)
+
+    def _add_styles(self):
+        from config import (RPM_STYLES, BRAKE_STYLES, THROTTLE_STYLES,
+                            GEAR_STYLES, SHIFT_STYLES)
+        self._body.addWidget(_section_label("Visual Styles"))
+        style_rows = [
+            ("RPM indicator",  "rpm_style",      RPM_STYLES),
+            ("Brake bar",      "brake_style",    BRAKE_STYLES),
+            ("Throttle bar",   "throttle_style", THROTTLE_STYLES),
+            ("Gear number",    "gear_style",     GEAR_STYLES),
+            ("Shift Up",       "shift_up_style", SHIFT_STYLES),
+            ("Shift Down",     "shift_dn_style", SHIFT_STYLES),
+        ]
+        self._style_dropdowns: list[_StyleDropdown] = []
+        for label, attr, choices in style_rows:
+            dd = _StyleDropdown(label, self._config, attr, choices, self._apply)
+            self._style_dropdowns.append(dd)
+            self._body.addWidget(dd)
+
+    def _add_colours(self):
+        self._body.addWidget(_section_label("Colours"))
+        self._swatches: list[_SwatchButton] = []
+        colour_rows = [
+            ("Rev lights — zones",  ["colour_rev_zone1", "colour_rev_zone2", "colour_rev_zone3"]),
+            ("Brake bar",           ["colour_brake_start", "colour_brake_end"]),
+            ("Throttle bar",        ["colour_throttle_start", "colour_throttle_end"]),
+            ("Shift indicator",     ["colour_shift_active"]),
+            ("Gear box",            ["colour_gear_bg", "colour_gear_text"]),
+        ]
+        for label, attrs in colour_rows:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addStretch()
+            swatches = QHBoxLayout()
+            swatches.setSpacing(4)
+            for attr in attrs:
+                sw = _SwatchButton(self._config, attr, self._apply)
+                self._swatches.append(sw)
+                swatches.addWidget(sw)
+            row.addLayout(swatches)
+            self._body.addLayout(row)
+
+
+# ── SettingsPanel ─────────────────────────────────────────────────────────────
+
 class SettingsPanel(QDialog):
 
     def __init__(self, config: Config, config_path: Path, tel, overlay):
-        super().__init__(overlay)
+        super().__init__()
         self._config = config
         self._config_path = config_path
         self._tel = tel
@@ -533,7 +771,8 @@ class SettingsPanel(QDialog):
         header.mouseMoveEvent  = self._hdr_move
 
         # ── Scrollable body ───────────────────────────────────────────────────
-        scroll = _ScrollArea()
+        self._scroll = _ScrollArea()
+        scroll = self._scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body_widget = QWidget()
@@ -544,7 +783,9 @@ class SettingsPanel(QDialog):
         root.addWidget(scroll)
 
         self._build_sections()
-        self.resize(540, 640)
+        from PyQt6.QtGui import QKeySequence, QShortcut
+        QShortcut(QKeySequence("Escape"), self, activated=self.close)
+        self.resize(540, 520)
 
     def _apply(self):
         save_config(self._config_path, self._config)
@@ -558,12 +799,21 @@ class SettingsPanel(QDialog):
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._scroll.verticalScrollBar().setValue(0)
+        from PyQt6.QtGui import QGuiApplication
+        screen = QGuiApplication.primaryScreen().geometry()
+        x = screen.x() + (screen.width() - self.width()) // 2
+        y = screen.y() + (screen.height() - self.height()) // 4
+        self.move(x, y)
+
+    # ── Section order ─────────────────────────────────────────────────────────
+
     def _build_sections(self):
+        self._add_edit_layout()          # Layout first
+        self._body.addWidget(_divider())
         self._add_transmission()
-        self._body.addWidget(_divider())
-        self._add_overlay_elements()
-        self._body.addWidget(_divider())
-        self._add_colours()
         self._body.addWidget(_divider())
         self._add_controller_buttons()
         self._body.addWidget(_divider())
@@ -571,10 +821,31 @@ class SettingsPanel(QDialog):
         self._body.addWidget(_divider())
         self._add_restore_defaults()
         self._body.addWidget(_divider())
-        self._add_network()
+        self._add_advanced()
         self._body.addWidget(_divider())
         self._add_developer()
         self._body.addStretch()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _add_edit_layout(self):
+        self._body.addWidget(_section_label("Layout"))
+        row = QHBoxLayout()
+        lbl = QLabel("Drag and resize each element on screen")
+        lbl.setStyleSheet("color: #666;")
+        row.addWidget(lbl)
+        row.addStretch()
+        btn = QPushButton("Edit Layout")
+        btn.setStyleSheet("border-color: #3b82f6; color: #3b82f6;")
+        btn.clicked.connect(self._launch_edit_layout)
+        row.addWidget(btn)
+        self._body.addLayout(row)
+
+    def _launch_edit_layout(self):
+        self.close()
+        self._overlay.toggle_edit_mode(reopen_settings=True)
+
+    # ── Transmission ─────────────────────────────────────────────────────────
 
     def _add_transmission(self):
         self._body.addWidget(_section_label("Transmission"))
@@ -595,56 +866,17 @@ class SettingsPanel(QDialog):
         self._body.addLayout(row)
 
     def _set_transmission(self, value: str):
+        prev = self._config.transmission
         self._config.transmission = value
-        auto = value == "automatic"
-        self._config.show_gear = not auto
-        self._config.show_shift_indicators = not auto
+        if value == "automatic":
+            self._config.show_gear = False
+            self._config.show_shift_indicators = False
+        elif prev == "automatic":
+            self._config.show_gear = True
+            self._config.show_shift_indicators = True
         self._apply()
 
-    def _add_overlay_elements(self):
-        self._body.addWidget(_section_label("Overlay elements"))
-        self._toggles: list[_Toggle] = []
-        toggles = [
-            ("Rev lights",         "show_rev_lights"),
-            ("Gear indicator",     "show_gear"),
-            ("Shift up / down",    "show_shift_indicators"),
-            ("Brake bar",          "show_brake_bar"),
-            ("Throttle bar",       "show_throttle_bar"),
-            ("Brake % label",      "show_brake_label"),
-            ("Throttle % label",   "show_throttle_label"),
-        ]
-        for label, attr in toggles:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addStretch()
-            t = _Toggle(self._config, attr, self._apply)
-            self._toggles.append(t)
-            row.addWidget(t)
-            self._body.addLayout(row)
-
-    def _add_colours(self):
-        self._body.addWidget(_section_label("Colours"))
-        self._swatches: list[_SwatchButton] = []
-        colour_rows = [
-            ("Rev lights — zones",  ["colour_rev_zone1", "colour_rev_zone2", "colour_rev_zone3"]),
-            ("Brake bar",           ["colour_brake_start", "colour_brake_end"]),
-            ("Throttle bar",        ["colour_throttle_start", "colour_throttle_end"]),
-            ("Shift indicator",     ["colour_shift_active"]),
-            ("Gear box",            ["colour_gear_bg", "colour_gear_text"]),
-            ("Overlay background",  ["colour_overlay_bg"]),
-        ]
-        for label, attrs in colour_rows:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addStretch()
-            swatches = QHBoxLayout()
-            swatches.setSpacing(4)
-            for attr in attrs:
-                sw = _SwatchButton(self._config, attr, self._apply)
-                self._swatches.append(sw)
-                swatches.addWidget(sw)
-            row.addLayout(swatches)
-            self._body.addLayout(row)
+    # ── Controller buttons ────────────────────────────────────────────────────
 
     def _add_controller_buttons(self):
         self._body.addWidget(_section_label("Controller buttons"))
@@ -656,6 +888,8 @@ class SettingsPanel(QDialog):
         ]
         for label, attr in bindings:
             self._body.addWidget(_BindRow(label, self._config, attr, self._apply))
+
+    # ── Calibration ───────────────────────────────────────────────────────────
 
     def _add_calibration(self):
         self._body.addWidget(_section_label("Calibration"))
@@ -674,9 +908,20 @@ class SettingsPanel(QDialog):
         self._body.addLayout(row)
 
     def _reset_calibration(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Reset Calibration",
+            "Clear all learned RPM redlines?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         self._tel.reset_calibration()
         self._cal_status.setText("Reset ✓")
         QTimer.singleShot(3000, lambda: self._cal_status.setText(""))
+
+    # ── Restore defaults ──────────────────────────────────────────────────────
 
     def _add_restore_defaults(self):
         self._body.addWidget(_section_label("Restore defaults"))
@@ -695,64 +940,132 @@ class SettingsPanel(QDialog):
         self._body.addLayout(row)
 
     def _do_restore_defaults(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Restore Defaults",
+            "Reset all colours, visibility, styles, position, and scale to factory defaults?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         d = Config()
         c = self._config
-        # Reset all colour fields
         for attr in (
             "colour_rev_zone1", "colour_rev_zone2", "colour_rev_zone3",
             "colour_brake_start", "colour_brake_end",
             "colour_throttle_start", "colour_throttle_end",
             "colour_shift_active", "colour_gear_bg", "colour_gear_text",
-            "colour_overlay_bg",
         ):
             setattr(c, attr, getattr(d, attr))
-        # Reset all visibility toggles
         for attr in (
             "show_rev_lights", "show_gear", "show_shift_indicators",
             "show_brake_bar", "show_throttle_bar",
             "show_brake_label", "show_throttle_label",
+            "brake_bar_reversed", "throttle_bar_reversed",
         ):
             setattr(c, attr, getattr(d, attr))
-        # Reset position, scale, and transmission
-        c.overlay_x = d.overlay_x
-        c.overlay_y = d.overlay_y
-        c.overlay_scale = d.overlay_scale
+        for attr in (
+            "rpm_style", "brake_style", "throttle_style",
+            "gear_style", "shift_up_style", "shift_dn_style",
+        ):
+            setattr(c, attr, getattr(d, attr))
+        for key in ("rpm", "brake", "throttle", "gear", "shift_up", "shift_dn"):
+            for dim in ("x", "y", "w", "h"):
+                setattr(c, f"{key}_{dim}", getattr(d, f"{key}_{dim}"))
         c.transmission = d.transmission
-        # Sync overlay live scale before apply_config reads _apply_layout
-        self._overlay._scale = d.overlay_scale
+        c.shift_ratio = d.shift_ratio
+        self._overlay._apply_default_layout()
         self._apply()
-        # Refresh dynamic UI widgets to reflect new values
-        for t in self._toggles:
-            t._refresh()
-        for sw in self._swatches:
-            sw._refresh()
+
+        # Refresh widgets still in this panel
         for value, rb in self._transmission_radios.items():
             rb.blockSignals(True)
             rb.setChecked(c.transmission == value)
             rb.blockSignals(False)
+        self._shift_slider.blockSignals(True)
+        self._shift_slider.setValue(int(c.shift_ratio * 100))
+        self._shift_label.setText(f"{int(c.shift_ratio * 100)}%")
+        self._shift_slider.blockSignals(False)
+
+        # Close the elements panel if open — its widgets would be stale
+        ep = getattr(self._overlay, '_elements_panel', None)
+        if ep is not None:
+            try:
+                ep.close()
+            except Exception:
+                pass
+
         self._restore_status.setText("Restored ✓")
         QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
 
-    def _add_network(self):
-        self._body.addWidget(_section_label("Network"))
-        row = QHBoxLayout()
-        row.addWidget(QLabel("UDP Port"))
-        row.addStretch()
+    # ── Advanced (shift point + network) ─────────────────────────────────────
+
+    def _add_advanced(self):
+        self._body.addWidget(_section_label("Advanced"))
+
+        # Shift point
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Shift point"))
+        row1.addStretch()
+        from PyQt6.QtWidgets import QSlider
+        self._shift_slider = QSlider(Qt.Orientation.Horizontal)
+        self._shift_slider.setRange(80, 98)
+        self._shift_slider.setValue(int(self._config.shift_ratio * 100))
+        self._shift_slider.setFixedWidth(120)
+        self._shift_slider.setToolTip("RPM fraction that triggers the shift flash (80%–98%)")
+        self._shift_label = QLabel(f"{int(self._config.shift_ratio * 100)}%")
+        self._shift_label.setFixedWidth(36)
+        self._shift_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        self._shift_slider.valueChanged.connect(self._on_shift_ratio_changed)
+        row1.addWidget(self._shift_slider)
+        row1.addWidget(self._shift_label)
+        self._body.addLayout(row1)
+
+        # UDP port
+        self._body.addWidget(_divider())
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("UDP Port"))
+        row2.addStretch()
         self._port_edit = QLineEdit(str(self._config.udp_port))
         self._port_edit.setFixedWidth(80)
         self._port_edit.editingFinished.connect(self._save_port)
-        row.addWidget(self._port_edit)
+        row2.addWidget(self._port_edit)
         note = QLabel("(restart required)")
         note.setStyleSheet("color: #555; font-size: 11px;")
-        row.addWidget(note)
-        self._body.addLayout(row)
+        row2.addWidget(note)
+        restart_btn = QPushButton("Restart Now")
+        restart_btn.setStyleSheet("border-color: #dc2626; color: #dc2626;")
+        restart_btn.clicked.connect(self._restart_app)
+        row2.addWidget(restart_btn)
+        self._body.addLayout(row2)
+
+    def _on_shift_ratio_changed(self, value: int):
+        self._config.shift_ratio = value / 100.0
+        self._shift_label.setText(f"{value}%")
+        self._apply()
+
+    def _restart_app(self):
+        import subprocess
+        self._save_port()
+        if getattr(sys, "frozen", False):
+            subprocess.Popen([sys.executable])
+        else:
+            subprocess.Popen([sys.executable] + sys.argv)
+        QApplication.instance().quit()
 
     def _save_port(self):
         try:
-            self._config.udp_port = int(self._port_edit.text())
+            port = int(self._port_edit.text())
+            if not (1 <= port <= 65535):
+                self._port_edit.setText(str(self._config.udp_port))
+                return
+            self._config.udp_port = port
             save_config(self._config_path, self._config)
         except ValueError:
             self._port_edit.setText(str(self._config.udp_port))
+
+    # ── Developer ─────────────────────────────────────────────────────────────
 
     def _add_developer(self):
         row = QHBoxLayout()
@@ -768,7 +1081,8 @@ class SettingsPanel(QDialog):
 
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
-        title = QLabel("Forza Horizon 6 RPM Overlay")
+        from config import VERSION
+        title = QLabel(f"Forza Horizon 6 RPM Overlay  v{VERSION}")
         title.setStyleSheet("color: #e5e5e5; font-size: 13px;")
         text_col.addWidget(title)
 

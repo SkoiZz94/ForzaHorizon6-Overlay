@@ -1,4 +1,3 @@
-# setup_wizard.py
 import ctypes
 from pathlib import Path
 
@@ -6,9 +5,10 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (QDialog, QLabel, QPushButton, QVBoxLayout,
                               QHBoxLayout, QFrame, QRadioButton, QButtonGroup,
-                              QWidget)
+                              QWidget, QMessageBox)
 
 from config import Config, save_config
+from controller import XINPUT_GAMEPAD, XINPUT_STATE
 
 _STYLESHEET = """
 QDialog { background-color: #0a0a0a; color: #f1f1f1; font-family: Consolas; }
@@ -26,18 +26,13 @@ QRadioButton::indicator { width: 14px; height: 14px; border-radius: 7px;
 QRadioButton::indicator:checked { background: #dc2626; border-color: #dc2626; }
 """
 
-
-class _XINPUT_GAMEPAD(ctypes.Structure):
-    _fields_ = [
-        ("wButtons", ctypes.c_ushort), ("bLeftTrigger", ctypes.c_ubyte),
-        ("bRightTrigger", ctypes.c_ubyte), ("sThumbLX", ctypes.c_short),
-        ("sThumbLY", ctypes.c_short), ("sThumbRX", ctypes.c_short),
-        ("sThumbRY", ctypes.c_short),
-    ]
-
-
-class _XINPUT_STATE(ctypes.Structure):
-    _fields_ = [("dwPacketNumber", ctypes.c_ulong), ("Gamepad", _XINPUT_GAMEPAD)]
+_STEP_LABELS = {
+    1: "Press your  SHIFT UP  button",
+    2: "Press your  SHIFT DOWN  button",
+    3: "Press your  CLUTCH  button",
+    4: "Press your  HIDE  button or combo",
+}
+_STEP_SKIPPABLE = {1: False, 2: False, 3: True, 4: True}
 
 
 class SetupWizard(QDialog):
@@ -47,13 +42,14 @@ class SetupWizard(QDialog):
         super().__init__()
         self._config_path = config_path
         self._captured: dict[str, int | str] = {}
-        self._step = 0          # 0=transmission, 1=shift_up, 2=shift_down, 3=clutch, 4=hide
+        self._step = 0
+        self._step_history: list[int] = []
         self._prev_buttons = 0
         self._xinput = self._load_xinput()
         self._capturing = False
 
         self.setWindowTitle("Forza Horizon 6 RPM Overlay — Setup")
-        self.setFixedSize(420, 200)
+        self.setFixedSize(420, 230)
         self.setWindowFlags(
             Qt.WindowType.Dialog |
             Qt.WindowType.FramelessWindowHint |
@@ -66,7 +62,6 @@ class SetupWizard(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Red header bar
         header = QFrame(objectName="header")
         header.setFixedHeight(36)
         hl = QHBoxLayout(header)
@@ -82,13 +77,12 @@ class SetupWizard(QDialog):
             "QPushButton { background:transparent; color:rgba(255,255,255,0.85);"
             " border:none; font-size:18px; padding:0; }"
         )
-        close_btn.clicked.connect(self.reject)
+        close_btn.clicked.connect(self._on_close)
         hl.addWidget(close_btn)
         root.addWidget(header)
         header.mousePressEvent = self._hdr_press
         header.mouseMoveEvent  = self._hdr_move
 
-        # Content area
         content = QWidget()
         self._content_layout = QVBoxLayout(content)
         self._content_layout.setContentsMargins(20, 16, 20, 16)
@@ -97,23 +91,32 @@ class SetupWizard(QDialog):
         self._label = QLabel()
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self._label.setWordWrap(True)
         self._content_layout.addWidget(self._label)
 
-        # Transmission radio buttons (shown only on step 0)
         self._radio_widget = QWidget()
         radio_layout = QHBoxLayout(self._radio_widget)
         radio_layout.setSpacing(16)
         self._radio_group = QButtonGroup(self)
         for i, label in enumerate(("Automatic", "Manual", "Manual w/ Clutch")):
             rb = QRadioButton(label)
-            if i == 1:   # default: Manual
+            if i == 1:
                 rb.setChecked(True)
             self._radio_group.addButton(rb, i)
             radio_layout.addWidget(rb)
         self._content_layout.addWidget(self._radio_widget)
 
-        # Buttons row
+        self._summary = QLabel()
+        self._summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._summary.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._summary.setWordWrap(True)
+        self._content_layout.addWidget(self._summary)
+        self._summary.hide()
+
         btn_row = QHBoxLayout()
+        self._back_btn = QPushButton("← Back")
+        self._back_btn.clicked.connect(self._go_back)
+        btn_row.addWidget(self._back_btn)
         btn_row.addStretch()
         self._skip_btn = QPushButton("Skip")
         self._skip_btn.clicked.connect(self._skip)
@@ -129,6 +132,12 @@ class SetupWizard(QDialog):
         self._timer.timeout.connect(self._poll)
 
         self._show_transmission_step()
+
+    def _on_close(self):
+        # F5: write defaults on rejection so main() has a valid config
+        if not self._config_path.exists():
+            save_config(self._config_path, Config())
+        self.reject()
 
     def _hdr_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -147,19 +156,35 @@ class SetupWizard(QDialog):
     def _current_buttons(self) -> int:
         if not self._xinput:
             return 0
-        xi = _XINPUT_STATE()
+        xi = XINPUT_STATE()
         return xi.Gamepad.wButtons if self._xinput.XInputGetState(0, ctypes.byref(xi)) == 0 else 0
 
+    def _total_steps(self) -> int:
+        transmission = self._captured.get("transmission", "manual")
+        if transmission == "automatic":
+            return 2   # transmission + hide
+        elif transmission == "manual":
+            return 4   # transmission + shift_up + shift_down + hide
+        else:
+            return 5   # transmission + shift_up + shift_down + clutch + hide
+
+    def _step_number(self) -> int:
+        return len(self._step_history) + 1
+
     def _show_transmission_step(self):
-        self._label.setText("(1/5)  Choose your transmission type")
+        self._label.setText("Choose your transmission type")
         self._radio_widget.setVisible(True)
+        self._summary.setVisible(False)
         self._skip_btn.setVisible(False)
+        self._back_btn.setVisible(False)
         self._next_btn.setVisible(True)
+        self._next_btn.setText("Next →")
         self._capturing = False
 
     def _next_transmission(self):
         btn_id = self._radio_group.checkedId()
         self._captured["transmission"] = ("automatic", "manual", "manual_clutch")[btn_id]
+        self._step_history.append(0)
         self._step = 1
         self._advance()
 
@@ -168,16 +193,15 @@ class SetupWizard(QDialog):
             self._finish()
             return
         self._radio_widget.setVisible(False)
+        self._summary.setVisible(False)
         self._next_btn.setVisible(False)
         transmission = self._captured.get("transmission", "manual")
 
-        # Skip shift buttons for automatic
         if self._step == 1 and transmission == "automatic":
             self._captured["shift_up_button"] = 0
             self._captured["shift_down_button"] = 0
             self._step = 3
 
-        # Skip clutch for non-manual_clutch
         if self._step == 3 and transmission != "manual_clutch":
             self._captured["clutch_button"] = 0
             self._step = 4
@@ -186,18 +210,26 @@ class SetupWizard(QDialog):
             self._finish()
             return
 
-        labels = {
-            1: ("(2/5)  Press your  SHIFT UP  button",      False),
-            2: ("(3/5)  Press your  SHIFT DOWN  button",    False),
-            3: ("(4/5)  Press your  CLUTCH  button",        True),
-            4: ("(5/5)  Press your  HIDE  button or combo", True),
-        }
-        text, skippable = labels[self._step]
+        total = self._total_steps()
+        displayed_n = self._step_number()
+        text = f"({displayed_n}/{total})  {_STEP_LABELS[self._step]}"
         self._label.setText(text)
-        self._skip_btn.setVisible(skippable)
+        self._skip_btn.setVisible(_STEP_SKIPPABLE[self._step])
+        self._back_btn.setVisible(True)
         self._prev_buttons = self._current_buttons()
         self._capturing = True
         self._timer.start(16)
+
+    def _go_back(self):
+        self._capturing = False
+        self._timer.stop()
+        if not self._step_history:
+            return
+        self._step = self._step_history.pop()
+        if self._step == 0:
+            self._show_transmission_step()
+        else:
+            self._advance()
 
     def _poll(self):
         if not self._capturing:
@@ -208,23 +240,26 @@ class SetupWizard(QDialog):
         if not new_pressed:
             return
 
-        field_map = {
-            1: "shift_up_button",
-            2: "shift_down_button",
-            3: "clutch_button",
-            4: "hide_button",
-        }
+        field_map = {1: "shift_up_button", 2: "shift_down_button",
+                     3: "clutch_button", 4: "hide_button"}
         field = field_map[self._step]
 
         if self._step == 4:
-            # Capture full combo: all buttons currently held
             self._captured[field] = current
         else:
-            # Single button: isolate lowest bit
-            self._captured[field] = new_pressed & (-new_pressed)
+            captured_mask = new_pressed & (-new_pressed)
+            # F4: warn if shift down same as shift up
+            if self._step == 2:
+                if captured_mask == self._captured.get("shift_up_button", 0):
+                    self._label.setText(
+                        "⚠  Same as Shift Up!\n\nPress a different button."
+                    )
+                    return
+            self._captured[field] = captured_mask
 
         self._capturing = False
         self._timer.stop()
+        self._step_history.append(self._step)
         self._step += 1
         self._advance()
 
@@ -233,6 +268,7 @@ class SetupWizard(QDialog):
         self._captured[field_map[self._step]] = 0
         self._capturing = False
         self._timer.stop()
+        self._step_history.append(self._step)
         self._step += 1
         self._advance()
 
@@ -250,4 +286,28 @@ class SetupWizard(QDialog):
             show_shift_indicators = transmission != "automatic",
         )
         save_config(self._config_path, cfg)
-        self.accept()
+
+        # U13: completion screen
+        self._radio_widget.setVisible(False)
+        self._skip_btn.setVisible(False)
+        self._back_btn.setVisible(False)
+        self._label.setText("Setup complete!")
+
+        su = f"0x{cfg.shift_up_button:04X}" if cfg.shift_up_button else "—"
+        sd = f"0x{cfg.shift_down_button:04X}" if cfg.shift_down_button else "—"
+        cl = f"0x{cfg.clutch_button:04X}" if cfg.clutch_button else "—"
+        hb = f"0x{cfg.hide_button:04X}" if cfg.hide_button else "—"
+        summary_lines = [
+            f"Transmission: {transmission.replace('_', ' ').title()}",
+            f"Shift Up: {su}   Shift Down: {sd}",
+        ]
+        if transmission == "manual_clutch":
+            summary_lines.append(f"Clutch: {cl}")
+        summary_lines.append(f"Hide: {hb}")
+        self._summary.setText("\n".join(summary_lines))
+        self._summary.setVisible(True)
+
+        self._next_btn.setText("Launch Overlay")
+        self._next_btn.setVisible(True)
+        self._next_btn.clicked.disconnect()
+        self._next_btn.clicked.connect(self.accept)
